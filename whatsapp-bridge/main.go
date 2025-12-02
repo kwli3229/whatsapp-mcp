@@ -773,7 +773,164 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			Path:     path,
 		})
 	})
+	// Handler for requesting history sync using oldest message as anchor
+	http.HandleFunc("/api/sync", func(w http.ResponseWriter, r *http.Request) {
+		// Only allow POST requests
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
 
+		// Set response headers
+		w.Header().Set("Content-Type", "application/json")
+
+		// Check if client is connected
+		if !client.IsConnected() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "Client is not connected to WhatsApp",
+			})
+			return
+		}
+
+		// Check if client is logged in
+		if client.Store.ID == nil {
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "Client is not logged in",
+			})
+			return
+		}
+
+		// Get optional chat_jid parameter
+		var reqBody map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&reqBody); err == nil {
+			// Body provided
+		} else {
+			reqBody = make(map[string]string)
+		}
+		chatJID := reqBody["chat_jid"]
+
+		// Query oldest message from database to use as anchor
+		var oldestMsg *types.MessageInfo
+		
+		query := "SELECT id, chat_jid, sender, timestamp, is_from_me FROM messages"
+		if chatJID != "" {
+			query += " WHERE chat_jid = '" + chatJID + "'"
+		}
+		query += " ORDER BY timestamp ASC LIMIT 1"
+		
+		rows, err := messageStore.db.Query(query)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": fmt.Sprintf("Database error: %v", err),
+			})
+			return
+		}
+		defer rows.Close()
+
+		if rows.Next() {
+			var msgID, chatJIDStr, sender, timestampStr string
+			var isFromMe bool
+			if err := rows.Scan(&msgID, &chatJIDStr, &sender, &timestampStr, &isFromMe); err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"message": fmt.Sprintf("Error reading oldest message: %v", err),
+				})
+				return
+			}
+
+			// Parse JID
+			parsedJID, err := types.ParseJID(chatJIDStr)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"message": fmt.Sprintf("Error parsing JID: %v", err),
+				})
+				return
+			}
+
+			// Parse timestamp - handle ISO8601 format with T separator
+			// Replace T with space and remove timezone
+			cleanTime := timestampStr
+			if len(cleanTime) > 19 {
+				cleanTime = cleanTime[:19] // Take only YYYY-MM-DDTHH:MM:SS
+			}
+			// Replace T with space for parsing
+			for i := 0; i < len(cleanTime); i++ {
+				if cleanTime[i] == 'T' {
+					cleanTime = cleanTime[:i] + " " + cleanTime[i+1:]
+					break
+				}
+			}
+			timestamp, err := time.Parse("2006-01-02 15:04:05", cleanTime)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"message": fmt.Sprintf("Error parsing timestamp: %v", err),
+				})
+				return
+			}
+
+			// Create MessageInfo
+			oldestMsg = &types.MessageInfo{
+				MessageSource: types.MessageSource{
+					Chat:     parsedJID,
+					IsFromMe: isFromMe,
+					IsGroup:  parsedJID.Server == "g.us",
+				},
+				ID:        msgID,
+				Timestamp: timestamp,
+			}
+
+			fmt.Printf("Using oldest message as anchor: %s from %s\n", msgID, timestampStr)
+		} else {
+			// No messages in database
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "No messages found in database. Cannot determine anchor point.",
+				"note":    "History sync needs at least one message as a starting point.",
+			})
+			return
+		}
+
+		// Request history sync in background
+		go func() {
+			fmt.Println("Requesting history sync with oldest message as anchor...")
+			historyMsg := client.BuildHistorySyncRequest(oldestMsg, 50)
+			if historyMsg == nil {
+				fmt.Println("Failed to build history sync request.")
+				return
+			}
+
+			_, err := client.SendMessage(context.Background(), client.Store.ID.ToNonAD(), historyMsg, whatsmeow.SendRequestExtra{Peer: true})
+			if err != nil {
+				fmt.Printf("Failed to request history sync: %v\n", err)
+			} else {
+				fmt.Println("History sync requested successfully. Messages will be synced in background.")
+			}
+		}()
+
+		// Send successful response
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"message": "History sync request sent using oldest message as anchor.",
+			"note":    "Up to 50 messages before the anchor will be synced. Check logs for progress.",
+			"anchor": map[string]string{
+				"message_id": oldestMsg.ID,
+				"timestamp":  oldestMsg.Timestamp.Format("2006-01-02 15:04:05"),
+				"chat":       oldestMsg.Chat.String(),
+			},
+		})
+	})
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
@@ -1005,9 +1162,12 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 	return name
 }
 
-// Handle history sync events
 func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, historySync *events.HistorySync, logger waLog.Logger) {
 	fmt.Printf("Received history sync event with %d conversations\n", len(historySync.Data.Conversations))
+	fmt.Printf("=== DEBUG: History Sync Details ===\n")
+	fmt.Printf("Type: %v\n", historySync.Data.SyncType)
+	fmt.Printf("Progress: %v\n", historySync.Data.Progress)
+	fmt.Printf("===================================\n")
 
 	syncedCount := 0
 	for _, conversation := range historySync.Data.Conversations {
@@ -1172,10 +1332,7 @@ func requestHistorySync(client *whatsmeow.Client) {
 		return
 	}
 
-	_, err := client.SendMessage(context.Background(), types.JID{
-		Server: "s.whatsapp.net",
-		User:   "status",
-	}, historyMsg)
+	_, err := client.SendMessage(context.Background(), client.Store.ID.ToNonAD(), historyMsg, whatsmeow.SendRequestExtra{Peer: true})
 
 	if err != nil {
 		fmt.Printf("Failed to request history sync: %v\n", err)
